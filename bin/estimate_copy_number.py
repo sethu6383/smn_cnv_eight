@@ -12,14 +12,23 @@ import argparse
 from pathlib import Path
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.mixture import GaussianMixture
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, confusion_matrix
-import joblib
+from collections import Counter
 from scipy import stats
 import warnings
 warnings.filterwarnings('ignore')
+
+# Try to import ML libraries, but continue without them if not available
+try:
+    from sklearn.ensemble import RandomForestClassifier, IsolationForest
+    from sklearn.mixture import GaussianMixture
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import classification_report, confusion_matrix
+    from sklearn.model_selection import cross_val_score
+    import joblib
+    ML_AVAILABLE = True
+except ImportError:
+    ML_AVAILABLE = False
+    print("Warning: ML libraries not available. Running without ML features.")
 
 # Enhanced copy number thresholds with confidence intervals
 DEFAULT_THRESHOLDS = {
@@ -124,8 +133,15 @@ def probabilistic_cnv_calling(z_score, thresholds, use_robust=True):
     Returns:
         Dictionary with copy number probabilities and predicted copy number
     """
-    import numpy as np
-    from scipy import stats
+    if pd.isna(z_score):
+        return {
+            'predicted_cn': 2,
+            'probability': 0.2,
+            'confidence': 0.0,
+            'confidence_level': 'low',
+            'all_probabilities': {0: 0.2, 1: 0.2, 2: 0.2, 3: 0.2, 4: 0.2},
+            'z_score': z_score
+        }
     
     # Define copy number categories and their expected z-score ranges
     cn_categories = {
@@ -217,85 +233,6 @@ def probabilistic_cnv_calling(z_score, thresholds, use_robust=True):
         'z_score': z_score
     }
 
-
-def consensus_cnv_calling(row, thresholds, ml_predictions_available=False):
-    """
-    Enhanced consensus CNV calling combining multiple methods
-    
-    Args:
-        row: Data row with z-score and other information
-        thresholds: Copy number thresholds
-        ml_predictions_available: Whether ML predictions are available
-    
-    Returns:
-        Dictionary with consensus results
-    """
-    import numpy as np
-    
-    z_score = row.get('z_score', 0)
-    sample_id = row.get('sample_id', 'unknown')
-    exon = row.get('exon', 'unknown')
-    
-    # Method 1: Standard probabilistic calling
-    std_result = probabilistic_cnv_calling(z_score, thresholds, use_robust=False)
-    
-    # Method 2: Robust probabilistic calling
-    robust_result = probabilistic_cnv_calling(z_score, thresholds, use_robust=True)
-    
-    # Method 3: Simple threshold-based calling
-    threshold_result = simple_threshold_calling(z_score, thresholds)
-    
-    # Collect all predictions
-    predictions = [std_result['predicted_cn'], robust_result['predicted_cn'], threshold_result['predicted_cn']]
-    
-    # Add ML prediction if available
-    if ml_predictions_available and 'ml_predicted_cn' in row:
-        ml_cn = row.get('ml_predicted_cn')
-        if ml_cn is not None:
-            predictions.append(ml_cn)
-    
-    # Calculate consensus
-    from collections import Counter
-    cn_counts = Counter(predictions)
-    consensus_cn = cn_counts.most_common(1)[0][0]
-    consensus_support = cn_counts[consensus_cn] / len(predictions)
-    
-    # Calculate average probability and confidence
-    avg_probability = (std_result['probability'] + robust_result['probability']) / 2
-    avg_confidence = (std_result['confidence'] + robust_result['confidence']) / 2
-    
-    # Determine overall confidence level
-    if consensus_support >= 0.8 and avg_confidence >= 0.3:
-        overall_confidence = 'high'
-    elif consensus_support >= 0.6 and avg_confidence >= 0.2:
-        overall_confidence = 'medium'
-    else:
-        overall_confidence = 'low'
-    
-    # Calculate uncertainty metrics
-    prediction_variance = np.var(predictions) if len(predictions) > 1 else 0
-    uncertainty_score = 1 - consensus_support
-    
-    return {
-        'sample_id': sample_id,
-        'exon': exon,
-        'z_score': z_score,
-        'consensus_cn': consensus_cn,
-        'consensus_support': consensus_support,
-        'avg_probability': avg_probability,
-        'avg_confidence': avg_confidence,
-        'confidence_level': overall_confidence,
-        'uncertainty_score': uncertainty_score,
-        'prediction_variance': prediction_variance,
-        'all_predictions': predictions,
-        'method_results': {
-            'standard': std_result,
-            'robust': robust_result,
-            'threshold': threshold_result
-        }
-    }
-
-
 def simple_threshold_calling(z_score, thresholds):
     """
     Simple threshold-based CNV calling for comparison
@@ -307,6 +244,14 @@ def simple_threshold_calling(z_score, thresholds):
     Returns:
         Dictionary with threshold-based results
     """
+    if pd.isna(z_score):
+        return {
+            'predicted_cn': 2,
+            'probability': 0.2,
+            'confidence': 0.0,
+            'confidence_level': 'low',
+            'z_score': z_score
+        }
     
     if z_score <= thresholds['homozygous_deletion']:
         predicted_cn = 0
@@ -351,58 +296,88 @@ def simple_threshold_calling(z_score, thresholds):
         'z_score': z_score
     }
 
-
-# Example usage and test function
-def test_probabilistic_calling():
-    """Test the fixed probabilistic calling function"""
+def consensus_cnv_calling(row, thresholds, ml_predictions_available=False):
+    """
+    Enhanced consensus CNV calling combining multiple methods
     
-    # Example thresholds
-    thresholds = {
-        'homozygous_deletion': -2.5,
-        'heterozygous_deletion': -1.5,
-        'normal_lower': -1.5,
-        'normal_upper': 1.5,
-        'duplication': 2.5,
-        'high_amplification': 3.5
+    Args:
+        row: Data row with z-score and other information
+        thresholds: Copy number thresholds
+        ml_predictions_available: Whether ML predictions are available
+    
+    Returns:
+        Dictionary with consensus results - FIXED to return expected format
+    """
+    z_score = row.get('z_score', 0)
+    sample_id = row.get('sample_id', 'unknown')
+    exon = row.get('exon', 'unknown')
+    
+    # Method 1: Standard probabilistic calling
+    std_result = probabilistic_cnv_calling(z_score, thresholds, use_robust=False)
+    
+    # Method 2: Robust probabilistic calling
+    robust_result = probabilistic_cnv_calling(z_score, thresholds, use_robust=True)
+    
+    # Method 3: Simple threshold-based calling
+    threshold_result = simple_threshold_calling(z_score, thresholds)
+    
+    # Collect all predictions
+    predictions = [std_result['predicted_cn'], robust_result['predicted_cn'], threshold_result['predicted_cn']]
+    
+    # Add ML prediction if available
+    if ml_predictions_available and 'ml_predicted_cn' in row:
+        ml_cn = row.get('ml_predicted_cn')
+        if ml_cn is not None and not pd.isna(ml_cn):
+            predictions.append(int(ml_cn))
+    
+    # Calculate consensus
+    cn_counts = Counter(predictions)
+    consensus_cn = cn_counts.most_common(1)[0][0]
+    consensus_support = cn_counts[consensus_cn] / len(predictions)
+    
+    # Calculate average probability and confidence
+    avg_probability = (std_result['probability'] + robust_result['probability']) / 2
+    avg_confidence = (std_result['confidence'] + robust_result['confidence']) / 2
+    
+    # Determine overall confidence level
+    if consensus_support >= 0.8 and avg_confidence >= 0.3:
+        overall_confidence = 'high'
+    elif consensus_support >= 0.6 and avg_confidence >= 0.2:
+        overall_confidence = 'medium'
+    else:
+        overall_confidence = 'low'
+    
+    # Calculate uncertainty metrics
+    prediction_variance = np.var(predictions) if len(predictions) > 1 else 0
+    uncertainty_score = 1 - consensus_support
+    
+    # Map copy number to category
+    cn_category_map = {
+        0: 'homozygous_deletion',
+        1: 'heterozygous_deletion',
+        2: 'normal',
+        3: 'duplication',
+        4: 'high_amplification'
     }
+    cn_category = cn_category_map.get(consensus_cn, 'unknown')
     
-    # Test cases
-    test_cases = [
-        -3.0,  # Should be CN=0
-        -2.0,  # Should be CN=1
-        0.0,   # Should be CN=2
-        2.0,   # Should be CN=3
-        4.0    # Should be CN=4
-    ]
-    
-    print("Testing probabilistic CNV calling:")
-    print("-" * 50)
-    
-    for z_score in test_cases:
-        result = probabilistic_cnv_calling(z_score, thresholds)
-        print(f"Z-score: {z_score:5.1f} -> CN: {result['predicted_cn']}, "
-              f"Prob: {result['probability']:.3f}, "
-              f"Conf: {result['confidence_level']}")
-        
-    # Test consensus calling
-    print("\nTesting consensus calling:")
-    print("-" * 30)
-    
-    test_row = {
-        'sample_id': 'test_sample',
-        'exon': 'exon8',
-        'z_score': -2.0
+    # FIXED: Return the format expected by the main function
+    return {
+        'copy_number': consensus_cn,
+        'cn_category': cn_category,
+        'confidence': overall_confidence,
+        'consensus_score': consensus_support,
+        'method_agreement': 1 - uncertainty_score,
+        'contributing_methods': ['probabilistic_std', 'probabilistic_robust', 'threshold'] + (['ml'] if ml_predictions_available else []),
+        'avg_probability': avg_probability,
+        'prediction_variance': prediction_variance,
+        'method_results': {
+            'standard': std_result,
+            'robust': robust_result,
+            'threshold': threshold_result
+        }
     }
-    
-    consensus_result = consensus_cnv_calling(test_row, thresholds)
-    print(f"Consensus CN: {consensus_result['consensus_cn']}")
-    print(f"Support: {consensus_result['consensus_support']:.2f}")
-    print(f"Confidence: {consensus_result['confidence_level']}")
 
-
-if __name__ == "__main__":
-    test_probabilistic_calling()
-    
 def calculate_z_score_probability(z_score, thresholds):
     """Calculate copy number probabilities from Z-score."""
     if pd.isna(z_score):
@@ -491,7 +466,6 @@ def probability_to_copy_number(prob_dict, z_score, thresholds):
             confidence = 'low'
     
     return cn_estimate, cn_category, confidence
-
 
 def get_category_from_cn(cn):
     """Map copy number to category."""
@@ -638,107 +612,115 @@ def create_enhanced_visualization(cn_results_df, gene_results_df, output_dir, th
     plot_dir = Path(output_dir) / 'plots'
     plot_dir.mkdir(exist_ok=True)
     
-    # Plot 1: Enhanced copy number distribution with confidence
-    plt.figure(figsize=(15, 10))
-    
-    exons = sorted(cn_results_df['exon'].unique())
-    
-    for i, exon in enumerate(exons):
-        plt.subplot(2, 3, i+1)
-        exon_data = cn_results_df[cn_results_df['exon'] == exon]
+    try:
+        # Plot 1: Enhanced copy number distribution with confidence
+        plt.figure(figsize=(15, 10))
         
-        # Color by confidence
-        high_conf = exon_data[exon_data['confidence'] == 'high']
-        med_conf = exon_data[exon_data['confidence'] == 'medium']
-        low_conf = exon_data[exon_data['confidence'] == 'low']
+        exons = sorted(cn_results_df['exon'].unique())
+        n_exons = len(exons)
+        n_cols = min(3, n_exons)
+        n_rows = (n_exons + n_cols - 1) // n_cols
         
-        plt.hist(high_conf['copy_number'], alpha=0.7, label='High confidence', color='green', bins=range(0, 6))
-        plt.hist(med_conf['copy_number'], alpha=0.7, label='Medium confidence', color='orange', bins=range(0, 6))
-        plt.hist(low_conf['copy_number'], alpha=0.7, label='Low confidence', color='red', bins=range(0, 6))
+        for i, exon in enumerate(exons):
+            plt.subplot(n_rows, n_cols, i+1)
+            exon_data = cn_results_df[cn_results_df['exon'] == exon]
+            
+            # Color by confidence
+            high_conf = exon_data[exon_data['confidence'] == 'high']
+            med_conf = exon_data[exon_data['confidence'] == 'medium']
+            low_conf = exon_data[exon_data['confidence'] == 'low']
+            
+            bins = np.arange(0, 6) - 0.5
+            plt.hist(high_conf['copy_number'], alpha=0.7, label='High confidence', color='green', bins=bins)
+            plt.hist(med_conf['copy_number'], alpha=0.7, label='Medium confidence', color='orange', bins=bins)
+            plt.hist(low_conf['copy_number'], alpha=0.7, label='Low confidence', color='red', bins=bins)
+            
+            plt.title(f'{exon} Copy Number Distribution')
+            plt.xlabel('Copy Number')
+            plt.ylabel('Sample Count')
+            plt.legend()
+            plt.xticks(range(0, 5))
         
-        plt.title(f'{exon} Copy Number Distribution')
-        plt.xlabel('Copy Number')
-        plt.ylabel('Sample Count')
-        plt.legend()
-        plt.xticks(range(0, 5))
-    
-    plt.tight_layout()
-    plt.savefig(plot_dir / 'enhanced_cn_distributions.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    # Plot 2: Consensus scores vs copy number
-    plt.figure(figsize=(12, 8))
-    
-    for i, exon in enumerate(exons):
-        plt.subplot(1, len(exons), i+1)
-        exon_data = cn_results_df[cn_results_df['exon'] == exon]
+        plt.tight_layout()
+        plt.savefig(plot_dir / 'enhanced_cn_distributions.png', dpi=300, bbox_inches='tight')
+        plt.close()
         
-        scatter = plt.scatter(exon_data['copy_number'], exon_data['consensus_score'],
-                            c=exon_data['method_agreement'], cmap='viridis',
-                            alpha=0.7, s=50)
-        plt.xlabel('Copy Number')
-        plt.ylabel('Consensus Score')
-        plt.title(f'{exon}')
-        plt.colorbar(scatter, label='Method Agreement')
-    
-    plt.tight_layout()
-    plt.savefig(plot_dir / 'consensus_analysis.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    # Plot 3: Gene-level clinical significance
-    if not gene_results_df.empty:
+        # Plot 2: Consensus scores vs copy number
         plt.figure(figsize=(12, 8))
         
-        # Create significance category mapping
-        sig_categories = gene_results_df['clinical_significance'].value_counts()
-        
-        plt.subplot(1, 2, 1)
-        plt.pie(sig_categories.values, labels=sig_categories.index, autopct='%1.1f%%')
-        plt.title('Clinical Significance Distribution')
-        
-        plt.subplot(1, 2, 2)
-        
-        # Confidence vs copy number for SMN1
-        smn1_data = gene_results_df[gene_results_df['gene'] == 'SMN1']
-        if not smn1_data.empty:
-            scatter = plt.scatter(smn1_data['estimated_copy_number'], 
-                                smn1_data['confidence_score'],
-                                c=pd.Categorical(smn1_data['clinical_significance']).codes,
-                                cmap='Set1', alpha=0.7, s=100)
-            plt.xlabel('SMN1 Copy Number')
-            plt.ylabel('Confidence Score')
-            plt.title('SMN1: Copy Number vs Confidence')
+        for i, exon in enumerate(exons):
+            plt.subplot(1, len(exons), i+1)
+            exon_data = cn_results_df[cn_results_df['exon'] == exon]
             
-            # Add clinical thresholds
-            plt.axvline(x=0.5, color='red', linestyle='--', alpha=0.5, label='SMA affected')
-            plt.axvline(x=1.5, color='orange', linestyle='--', alpha=0.5, label='SMA carrier')
-            plt.legend()
+            scatter = plt.scatter(exon_data['copy_number'], exon_data['consensus_score'],
+                                c=exon_data['method_agreement'], cmap='viridis',
+                                alpha=0.7, s=50)
+            plt.xlabel('Copy Number')
+            plt.ylabel('Consensus Score')
+            plt.title(f'{exon}')
+            plt.colorbar(scatter, label='Method Agreement')
         
         plt.tight_layout()
-        plt.savefig(plot_dir / 'clinical_significance.png', dpi=300, bbox_inches='tight')
+        plt.savefig(plot_dir / 'consensus_analysis.png', dpi=300, bbox_inches='tight')
         plt.close()
-    
-    # Plot 4: Bootstrap confidence intervals (if available)
-    if bootstrap_results is not None and not bootstrap_results.empty:
-        plt.figure(figsize=(12, 6))
         
-        plt.subplot(1, 2, 1)
-        plt.hist(bootstrap_results['bootstrap_confidence'], bins=20, alpha=0.7, edgecolor='black')
-        plt.xlabel('Bootstrap Confidence')
-        plt.ylabel('Sample Count')
-        plt.title('Bootstrap Confidence Distribution')
+        # Plot 3: Gene-level clinical significance
+        if not gene_results_df.empty:
+            plt.figure(figsize=(12, 8))
+            
+            # Create significance category mapping
+            sig_categories = gene_results_df['clinical_significance'].value_counts()
+            
+            plt.subplot(1, 2, 1)
+            plt.pie(sig_categories.values, labels=sig_categories.index, autopct='%1.1f%%')
+            plt.title('Clinical Significance Distribution')
+            
+            plt.subplot(1, 2, 2)
+            
+            # Confidence vs copy number for SMN1
+            smn1_data = gene_results_df[gene_results_df['gene'] == 'SMN1']
+            if not smn1_data.empty:
+                scatter = plt.scatter(smn1_data['estimated_copy_number'], 
+                                    smn1_data['confidence_score'],
+                                    c=pd.Categorical(smn1_data['clinical_significance']).codes,
+                                    cmap='Set1', alpha=0.7, s=100)
+                plt.xlabel('SMN1 Copy Number')
+                plt.ylabel('Confidence Score')
+                plt.title('SMN1: Copy Number vs Confidence')
+                
+                # Add clinical thresholds
+                plt.axvline(x=0.5, color='red', linestyle='--', alpha=0.5, label='SMA affected')
+                plt.axvline(x=1.5, color='orange', linestyle='--', alpha=0.5, label='SMA carrier')
+                plt.legend()
+            
+            plt.tight_layout()
+            plt.savefig(plot_dir / 'clinical_significance.png', dpi=300, bbox_inches='tight')
+            plt.close()
         
-        plt.subplot(1, 2, 2)
-        plt.scatter(bootstrap_results['ci_width'], bootstrap_results['bootstrap_confidence'])
-        plt.xlabel('Confidence Interval Width')
-        plt.ylabel('Bootstrap Confidence')
-        plt.title('CI Width vs Bootstrap Confidence')
+        # Plot 4: Bootstrap confidence intervals (if available)
+        if bootstrap_results is not None and not bootstrap_results.empty:
+            plt.figure(figsize=(12, 6))
+            
+            plt.subplot(1, 2, 1)
+            plt.hist(bootstrap_results['bootstrap_confidence'], bins=20, alpha=0.7, edgecolor='black')
+            plt.xlabel('Bootstrap Confidence')
+            plt.ylabel('Sample Count')
+            plt.title('Bootstrap Confidence Distribution')
+            
+            plt.subplot(1, 2, 2)
+            plt.scatter(bootstrap_results['ci_width'], bootstrap_results['bootstrap_confidence'])
+            plt.xlabel('Confidence Interval Width')
+            plt.ylabel('Bootstrap Confidence')
+            plt.title('CI Width vs Bootstrap Confidence')
+            
+            plt.tight_layout()
+            plt.savefig(plot_dir / 'bootstrap_analysis.png', dpi=300, bbox_inches='tight')
+            plt.close()
         
-        plt.tight_layout()
-        plt.savefig(plot_dir / 'bootstrap_analysis.png', dpi=300, bbox_inches='tight')
-        plt.close()
-    
-    print(f"Enhanced visualizations saved to: {plot_dir}")
+        print(f"Enhanced visualizations saved to: {plot_dir}")
+        
+    except Exception as e:
+        print(f"Warning: Could not create all visualizations: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description='Enhanced CNV estimation with ML and bootstrap confidence')
@@ -774,17 +756,22 @@ def main():
         sys.exit(1)
     
     # Identify reference samples for bootstrap
-    reference_samples = z_scores_df[z_scores_df['sample_type'] == 'reference']['sample_id'].unique()
+    reference_samples = []
+    if 'sample_type' in z_scores_df.columns:
+        reference_samples = z_scores_df[z_scores_df['sample_type'] == 'reference']['sample_id'].unique()
     
     # Bootstrap threshold optimization (if enough reference samples)
-    if len(reference_samples) >= 10:
+    if len(reference_samples) >= 10 and args.bootstrap_samples > 0:
         print("Optimizing thresholds using bootstrap analysis...")
         bootstrap_thresholds = bootstrap_z_score_thresholds(z_scores_df, reference_samples, args.bootstrap_samples)
         thresholds.update(bootstrap_thresholds)
     
     # Check for ML predictions
-    ml_columns = [col for col in z_scores_df.columns if 'random_forest' in col or 'gmm' in col]
-    ml_predictions_available = len(ml_columns) > 0 and args.enable_ml
+    ml_columns = [col for col in z_scores_df.columns if 'random_forest' in col or 'gmm' in col or 'ml_predicted' in col]
+    ml_predictions_available = len(ml_columns) > 0 and args.enable_ml and ML_AVAILABLE
+    
+    if args.enable_ml and not ML_AVAILABLE:
+        print("Warning: ML features requested but ML libraries not available")
     
     print("Performing enhanced CNV estimation...")
     cn_results = []
@@ -827,10 +814,11 @@ def main():
         bootstrap_results = bootstrap_confidence_intervals(z_scores_df, args.bootstrap_samples)
         
         # Merge bootstrap results
-        cn_results_df = cn_results_df.merge(
-            bootstrap_results[['sample_id', 'bootstrap_confidence', 'ci_width']], 
-            on='sample_id', how='left'
-        )
+        if not bootstrap_results.empty:
+            cn_results_df = cn_results_df.merge(
+                bootstrap_results[['sample_id', 'bootstrap_confidence', 'ci_width']], 
+                on='sample_id', how='left'
+            )
     
     # Enhanced gene-level estimates
     print("Calculating enhanced gene-level copy numbers...")
@@ -851,7 +839,7 @@ def main():
             f.write(f"{name}\t{value}\tEnhanced threshold\n")
     
     # Save bootstrap results if available
-    if bootstrap_results is not None:
+    if bootstrap_results is not None and not bootstrap_results.empty:
         bootstrap_output_file = args.output_file.replace('.txt', '_bootstrap.txt')
         bootstrap_results.to_csv(bootstrap_output_file, index=False, sep='\t')
     
@@ -869,7 +857,7 @@ def main():
     print(f"Gene-level results saved to: {gene_output_file}")
     print(f"Thresholds saved to: {threshold_output_file}")
     
-    if bootstrap_results is not None:
+    if bootstrap_results is not None and not bootstrap_results.empty:
         print(f"Bootstrap results saved to: {bootstrap_output_file}")
     
     # Enhanced summary statistics
@@ -907,7 +895,7 @@ def main():
         if low_consensus > 0:
             print(f"  - {low_consensus} calls have low consensus scores - verify results")
     
-    if bootstrap_results is not None:
+    if bootstrap_results is not None and not bootstrap_results.empty:
         low_bootstrap_conf = (bootstrap_results['bootstrap_confidence'] < 0.5).sum()
         if low_bootstrap_conf > 0:
             print(f"  - {low_bootstrap_conf} samples have low bootstrap confidence")
@@ -916,8 +904,57 @@ def main():
     print(f"  - Minimum consensus score: 0.7")
     print(f"  - Minimum confidence: medium or high")
     print(f"  - Maximum outlier probability: 0.1")
-    if bootstrap_results is not None:
+    if bootstrap_results is not None and not bootstrap_results.empty:
         print(f"  - Minimum bootstrap confidence: 0.5")
 
+def test_probabilistic_calling():
+    """Test the fixed probabilistic calling function"""
+    
+    # Example thresholds
+    thresholds = {
+        'homozygous_deletion': -2.5,
+        'heterozygous_deletion': -1.5,
+        'normal_lower': -1.5,
+        'normal_upper': 1.5,
+        'duplication': 2.5,
+        'high_amplification': 3.5
+    }
+    
+    # Test cases
+    test_cases = [
+        -3.0,  # Should be CN=0
+        -2.0,  # Should be CN=1
+        0.0,   # Should be CN=2
+        2.0,   # Should be CN=3
+        4.0    # Should be CN=4
+    ]
+    
+    print("Testing probabilistic CNV calling:")
+    print("-" * 50)
+    
+    for z_score in test_cases:
+        result = probabilistic_cnv_calling(z_score, thresholds)
+        print(f"Z-score: {z_score:5.1f} -> CN: {result['predicted_cn']}, "
+              f"Prob: {result['probability']:.3f}, "
+              f"Conf: {result['confidence_level']}")
+        
+    # Test consensus calling
+    print("\nTesting consensus calling:")
+    print("-" * 30)
+    
+    test_row = {
+        'sample_id': 'test_sample',
+        'exon': 'exon8',
+        'z_score': -2.0
+    }
+    
+    consensus_result = consensus_cnv_calling(test_row, thresholds)
+    print(f"Consensus CN: {consensus_result['copy_number']}")
+    print(f"Support: {consensus_result['consensus_score']:.2f}")
+    print(f"Confidence: {consensus_result['confidence']}")
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == '--test':
+        test_probabilistic_calling()
+    else:
+        main()
