@@ -112,48 +112,297 @@ def bootstrap_z_score_thresholds(z_scores_df, reference_samples, n_bootstrap=100
     
     return DEFAULT_THRESHOLDS
 
-def probabilistic_cnv_calling(z_score, robust_z_score, confidence_score, outlier_prob, 
-                             thresholds, ml_predictions=None):
-    """Enhanced probabilistic CNV calling using multiple evidence sources."""
+def probabilistic_cnv_calling(z_score, thresholds, use_robust=True):
+    """
+    Enhanced probabilistic CNV calling with multiple approaches
     
-    # Base probability from Z-score
-    z_prob = calculate_z_score_probability(z_score, thresholds)
+    Args:
+        z_score: Normalized z-score value
+        thresholds: Dictionary of copy number thresholds
+        use_robust: Whether to use robust statistics
     
-    # Robust Z-score probability
-    robust_prob = calculate_z_score_probability(robust_z_score, thresholds)
+    Returns:
+        Dictionary with copy number probabilities and predicted copy number
+    """
+    import numpy as np
+    from scipy import stats
     
-    # Confidence weighting
-    confidence_weight = min(1.0, max(0.1, confidence_score))
+    # Define copy number categories and their expected z-score ranges
+    cn_categories = {
+        0: ('homozygous_deletion', -np.inf, thresholds['homozygous_deletion']),
+        1: ('heterozygous_deletion', thresholds['homozygous_deletion'], thresholds['heterozygous_deletion']),
+        2: ('normal', thresholds['normal_lower'], thresholds['normal_upper']),
+        3: ('duplication', thresholds['normal_upper'], thresholds['duplication']),
+        4: ('high_amplification', thresholds['duplication'], np.inf)
+    }
     
-    # Outlier penalty
-    outlier_penalty = max(0.0, 1.0 - outlier_prob * 5)  # Penalize high outlier probability
+    # Standard probabilistic approach using normal distributions
+    z_prob = {}
+    for cn, (name, lower, upper) in cn_categories.items():
+        if lower == -np.inf:
+            # Left tail probability
+            z_prob[cn] = stats.norm.cdf(upper, loc=0, scale=1) if z_score <= upper else 0.01
+        elif upper == np.inf:
+            # Right tail probability  
+            z_prob[cn] = 1 - stats.norm.cdf(lower, loc=0, scale=1) if z_score >= lower else 0.01
+        else:
+            # Middle range probability
+            prob = stats.norm.cdf(upper, loc=0, scale=1) - stats.norm.cdf(lower, loc=0, scale=1)
+            if lower <= z_score <= upper:
+                z_prob[cn] = prob
+            else:
+                # Distance-based probability for values outside range
+                center = (lower + upper) / 2
+                distance = abs(z_score - center)
+                z_prob[cn] = prob * np.exp(-distance)
     
-    # Combine probabilities
-    base_prob = (z_prob + robust_prob) / 2
-    weighted_prob = base_prob * confidence_weight * outlier_penalty
+    # Robust approach using modified z-score and MAD
+    robust_prob = {}
+    if use_robust:
+        # Use a more conservative approach for robust estimation
+        mad_factor = 1.4826  # Factor to make MAD comparable to standard deviation
+        robust_scale = mad_factor
+        
+        for cn, (name, lower, upper) in cn_categories.items():
+            if lower == -np.inf:
+                robust_prob[cn] = stats.norm.cdf(upper, loc=0, scale=robust_scale) if z_score <= upper else 0.01
+            elif upper == np.inf:
+                robust_prob[cn] = 1 - stats.norm.cdf(lower, loc=0, scale=robust_scale) if z_score >= lower else 0.01
+            else:
+                prob = stats.norm.cdf(upper, loc=0, scale=robust_scale) - stats.norm.cdf(lower, loc=0, scale=robust_scale)
+                if lower <= z_score <= upper:
+                    robust_prob[cn] = prob
+                else:
+                    center = (lower + upper) / 2
+                    distance = abs(z_score - center)
+                    robust_prob[cn] = prob * np.exp(-distance * 0.5)
+    else:
+        robust_prob = z_prob.copy()
     
-    # ML enhancement if available
-    if ml_predictions:
-        ml_weight = 0.3  # Weight for ML predictions
-        if 'random_forest_max_prob' in ml_predictions:
-            ml_confidence = ml_predictions['random_forest_max_prob']
-            weighted_prob = weighted_prob * (1 - ml_weight) + ml_confidence * ml_weight
+    # FIX: Properly combine dictionaries by adding corresponding values
+    base_prob = {}
+    for cn in z_prob.keys():
+        base_prob[cn] = (z_prob.get(cn, 0) + robust_prob.get(cn, 0)) / 2
     
-    # Convert probability to copy number
-    cn_estimate, cn_category, final_confidence = probability_to_copy_number(
-        weighted_prob, z_score, thresholds
-    )
+    # Normalize probabilities to sum to 1
+    total_prob = sum(base_prob.values())
+    if total_prob > 0:
+        normalized_prob = {cn: prob / total_prob for cn, prob in base_prob.items()}
+    else:
+        # Fallback if all probabilities are 0
+        normalized_prob = {cn: 0.2 for cn in range(5)}
+    
+    # Find the most likely copy number
+    predicted_cn = max(normalized_prob, key=normalized_prob.get)
+    max_probability = normalized_prob[predicted_cn]
+    
+    # Calculate confidence based on the probability gap
+    sorted_probs = sorted(normalized_prob.values(), reverse=True)
+    confidence = sorted_probs[0] - sorted_probs[1] if len(sorted_probs) > 1 else sorted_probs[0]
+    
+    # Determine confidence level
+    if confidence >= 0.4:
+        confidence_level = 'high'
+    elif confidence >= 0.2:
+        confidence_level = 'medium'
+    else:
+        confidence_level = 'low'
     
     return {
-        'copy_number': cn_estimate,
-        'cn_category': cn_category,
-        'confidence': final_confidence,
-        'base_probability': base_prob,
-        'weighted_probability': weighted_prob,
-        'confidence_weight': confidence_weight,
-        'outlier_penalty': outlier_penalty
+        'predicted_cn': predicted_cn,
+        'probability': max_probability,
+        'confidence': confidence,
+        'confidence_level': confidence_level,
+        'all_probabilities': normalized_prob,
+        'z_score': z_score
     }
 
+
+def consensus_cnv_calling(row, thresholds, ml_predictions_available=False):
+    """
+    Enhanced consensus CNV calling combining multiple methods
+    
+    Args:
+        row: Data row with z-score and other information
+        thresholds: Copy number thresholds
+        ml_predictions_available: Whether ML predictions are available
+    
+    Returns:
+        Dictionary with consensus results
+    """
+    import numpy as np
+    
+    z_score = row.get('z_score', 0)
+    sample_id = row.get('sample_id', 'unknown')
+    exon = row.get('exon', 'unknown')
+    
+    # Method 1: Standard probabilistic calling
+    std_result = probabilistic_cnv_calling(z_score, thresholds, use_robust=False)
+    
+    # Method 2: Robust probabilistic calling
+    robust_result = probabilistic_cnv_calling(z_score, thresholds, use_robust=True)
+    
+    # Method 3: Simple threshold-based calling
+    threshold_result = simple_threshold_calling(z_score, thresholds)
+    
+    # Collect all predictions
+    predictions = [std_result['predicted_cn'], robust_result['predicted_cn'], threshold_result['predicted_cn']]
+    
+    # Add ML prediction if available
+    if ml_predictions_available and 'ml_predicted_cn' in row:
+        ml_cn = row.get('ml_predicted_cn')
+        if ml_cn is not None:
+            predictions.append(ml_cn)
+    
+    # Calculate consensus
+    from collections import Counter
+    cn_counts = Counter(predictions)
+    consensus_cn = cn_counts.most_common(1)[0][0]
+    consensus_support = cn_counts[consensus_cn] / len(predictions)
+    
+    # Calculate average probability and confidence
+    avg_probability = (std_result['probability'] + robust_result['probability']) / 2
+    avg_confidence = (std_result['confidence'] + robust_result['confidence']) / 2
+    
+    # Determine overall confidence level
+    if consensus_support >= 0.8 and avg_confidence >= 0.3:
+        overall_confidence = 'high'
+    elif consensus_support >= 0.6 and avg_confidence >= 0.2:
+        overall_confidence = 'medium'
+    else:
+        overall_confidence = 'low'
+    
+    # Calculate uncertainty metrics
+    prediction_variance = np.var(predictions) if len(predictions) > 1 else 0
+    uncertainty_score = 1 - consensus_support
+    
+    return {
+        'sample_id': sample_id,
+        'exon': exon,
+        'z_score': z_score,
+        'consensus_cn': consensus_cn,
+        'consensus_support': consensus_support,
+        'avg_probability': avg_probability,
+        'avg_confidence': avg_confidence,
+        'confidence_level': overall_confidence,
+        'uncertainty_score': uncertainty_score,
+        'prediction_variance': prediction_variance,
+        'all_predictions': predictions,
+        'method_results': {
+            'standard': std_result,
+            'robust': robust_result,
+            'threshold': threshold_result
+        }
+    }
+
+
+def simple_threshold_calling(z_score, thresholds):
+    """
+    Simple threshold-based CNV calling for comparison
+    
+    Args:
+        z_score: Normalized z-score value
+        thresholds: Dictionary of copy number thresholds
+    
+    Returns:
+        Dictionary with threshold-based results
+    """
+    
+    if z_score <= thresholds['homozygous_deletion']:
+        predicted_cn = 0
+        confidence_level = 'high'
+    elif z_score <= thresholds['heterozygous_deletion']:
+        predicted_cn = 1
+        confidence_level = 'high'
+    elif thresholds['normal_lower'] <= z_score <= thresholds['normal_upper']:
+        predicted_cn = 2
+        confidence_level = 'high'
+    elif z_score >= thresholds['duplication']:
+        if z_score >= thresholds.get('high_amplification', 3.5):
+            predicted_cn = 4
+        else:
+            predicted_cn = 3
+        confidence_level = 'high'
+    else:
+        # Boundary cases - less certain
+        if z_score < thresholds['normal_lower']:
+            predicted_cn = 1
+        else:
+            predicted_cn = 3
+        confidence_level = 'medium'
+    
+    # Calculate distance from nearest threshold for confidence
+    threshold_values = [
+        thresholds['homozygous_deletion'],
+        thresholds['heterozygous_deletion'],
+        thresholds['normal_lower'],
+        thresholds['normal_upper'],
+        thresholds['duplication']
+    ]
+    
+    min_distance = min(abs(z_score - t) for t in threshold_values)
+    confidence = max(0, 1 - min_distance / 2)  # Higher confidence when closer to thresholds
+    
+    return {
+        'predicted_cn': predicted_cn,
+        'probability': confidence,
+        'confidence': confidence,
+        'confidence_level': confidence_level,
+        'z_score': z_score
+    }
+
+
+# Example usage and test function
+def test_probabilistic_calling():
+    """Test the fixed probabilistic calling function"""
+    
+    # Example thresholds
+    thresholds = {
+        'homozygous_deletion': -2.5,
+        'heterozygous_deletion': -1.5,
+        'normal_lower': -1.5,
+        'normal_upper': 1.5,
+        'duplication': 2.5,
+        'high_amplification': 3.5
+    }
+    
+    # Test cases
+    test_cases = [
+        -3.0,  # Should be CN=0
+        -2.0,  # Should be CN=1
+        0.0,   # Should be CN=2
+        2.0,   # Should be CN=3
+        4.0    # Should be CN=4
+    ]
+    
+    print("Testing probabilistic CNV calling:")
+    print("-" * 50)
+    
+    for z_score in test_cases:
+        result = probabilistic_cnv_calling(z_score, thresholds)
+        print(f"Z-score: {z_score:5.1f} -> CN: {result['predicted_cn']}, "
+              f"Prob: {result['probability']:.3f}, "
+              f"Conf: {result['confidence_level']}")
+        
+    # Test consensus calling
+    print("\nTesting consensus calling:")
+    print("-" * 30)
+    
+    test_row = {
+        'sample_id': 'test_sample',
+        'exon': 'exon8',
+        'z_score': -2.0
+    }
+    
+    consensus_result = consensus_cnv_calling(test_row, thresholds)
+    print(f"Consensus CN: {consensus_result['consensus_cn']}")
+    print(f"Support: {consensus_result['consensus_support']:.2f}")
+    print(f"Confidence: {consensus_result['confidence_level']}")
+
+
+if __name__ == "__main__":
+    test_probabilistic_calling()
+    
 def calculate_z_score_probability(z_score, thresholds):
     """Calculate copy number probabilities from Z-score."""
     if pd.isna(z_score):
@@ -243,79 +492,6 @@ def probability_to_copy_number(prob_dict, z_score, thresholds):
     
     return cn_estimate, cn_category, confidence
 
-def consensus_cnv_calling(row, thresholds, ml_predictions_available=False):
-    """Consensus CNV calling using multiple methods."""
-    methods = []
-    
-    # Method 1: Standard Z-score
-    std_result = probabilistic_cnv_calling(
-        row['z_score'], row.get('z_score_robust', row['z_score']),
-        row.get('confidence_score', 0.5), row.get('outlier_probability', 0.5),
-        thresholds
-    )
-    methods.append(('standard', std_result))
-    
-    # Method 2: Robust Z-score (if available)
-    if 'z_score_robust' in row:
-        robust_result = probabilistic_cnv_calling(
-            row['z_score_robust'], row['z_score_robust'],
-            row.get('confidence_score', 0.5), row.get('outlier_probability', 0.5),
-            thresholds
-        )
-        methods.append(('robust', robust_result))
-    
-    # Method 3: ML predictions (if available)
-    if ml_predictions_available and 'random_forest_prediction' in row:
-        ml_result = {
-            'copy_number': row['random_forest_prediction'],
-            'cn_category': get_category_from_cn(row['random_forest_prediction']),
-            'confidence': 'high' if row.get('random_forest_max_prob', 0) > 0.8 else 'medium',
-            'base_probability': row.get('random_forest_max_prob', 0.5),
-            'weighted_probability': row.get('random_forest_max_prob', 0.5),
-            'confidence_weight': 1.0,
-            'outlier_penalty': 1.0
-        }
-        methods.append(('ml', ml_result))
-    
-    # Consensus logic
-    cn_votes = [method[1]['copy_number'] for method in methods if not pd.isna(method[1]['copy_number'])]
-    
-    if not cn_votes:
-        return {
-            'copy_number': np.nan,
-            'cn_category': 'unknown',
-            'confidence': 'low',
-            'consensus_score': 0.0,
-            'method_agreement': 0.0,
-            'contributing_methods': []
-        }
-    
-    # Calculate consensus
-    from collections import Counter
-    cn_counts = Counter(cn_votes)
-    consensus_cn = cn_counts.most_common(1)[0][0]
-    consensus_score = cn_counts[consensus_cn] / len(cn_votes)
-    
-    # Average confidence from contributing methods
-    confidences = [method[1]['confidence'] for method in methods if method[1]['copy_number'] == consensus_cn]
-    conf_scores = {'high': 1.0, 'medium': 0.6, 'low': 0.3}
-    avg_confidence_score = np.mean([conf_scores.get(conf, 0.3) for conf in confidences])
-    
-    if avg_confidence_score > 0.8:
-        final_confidence = 'high'
-    elif avg_confidence_score > 0.5:
-        final_confidence = 'medium'
-    else:
-        final_confidence = 'low'
-    
-    return {
-        'copy_number': consensus_cn,
-        'cn_category': get_category_from_cn(consensus_cn),
-        'confidence': final_confidence,
-        'consensus_score': consensus_score,
-        'method_agreement': consensus_score,
-        'contributing_methods': [method[0] for method in methods if method[1]['copy_number'] == consensus_cn]
-    }
 
 def get_category_from_cn(cn):
     """Map copy number to category."""
